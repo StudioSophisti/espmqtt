@@ -48,7 +48,7 @@ typedef struct {
 
 typedef enum {
     MQTT_STATE_ERROR = -1,
-    MQTT_STATE_UNKNOW = 0,
+    MQTT_STATE_UNKNOWN = 0,
     MQTT_STATE_INIT,
     MQTT_STATE_CONNECTED,
     MQTT_STATE_WAIT_TIMEOUT,
@@ -78,7 +78,7 @@ static esp_err_t esp_mqtt_set_config(esp_mqtt_client_handle_t client, const esp_
 static esp_err_t esp_mqtt_destroy_config(esp_mqtt_client_handle_t client);
 static esp_err_t esp_mqtt_connect(esp_mqtt_client_handle_t client, int timeout_ms);
 static esp_err_t esp_mqtt_abort_connection(esp_mqtt_client_handle_t client);
-static int esp_mqtt_client_ping(esp_mqtt_client_handle_t client);
+static esp_err_t esp_mqtt_client_ping(esp_mqtt_client_handle_t client);
 static char *create_string(const char *ptr, int len);
 
 static esp_err_t esp_mqtt_set_config(esp_mqtt_client_handle_t client, const esp_mqtt_client_config_t *config)
@@ -269,6 +269,8 @@ esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *co
     esp_mqtt_client_handle_t client = calloc(1, sizeof(struct esp_mqtt_client));
     mem_assert(client);
 
+    esp_mqtt_set_config(client, config);
+    
     client->transport_list = transport_list_init();
 
     transport_handle_t tcp = transport_tcp_init();
@@ -307,9 +309,6 @@ esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *co
         client->config->scheme = create_string("wss", 3);
     }
 #endif
-
-    esp_mqtt_set_config(client, config);
-
     if (client->config->uri) {
         if (esp_mqtt_client_set_uri(client, client->config->uri) != ESP_OK) {
             return NULL;
@@ -601,6 +600,8 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
         case MQTT_MSG_TYPE_PUBACK:
             if (is_valid_mqtt_msg(client, MQTT_MSG_TYPE_PUBLISH, msg_id)) {
                 ESP_LOGD(TAG, "received MQTT_MSG_TYPE_PUBACK, finish QoS1 publish");
+            client->event.event_id = MQTT_EVENT_PUBLISHED;
+            esp_mqtt_dispatch_event(client);
             }
 
             break;
@@ -619,6 +620,8 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
             ESP_LOGD(TAG, "received MQTT_MSG_TYPE_PUBCOMP");
             if (is_valid_mqtt_msg(client, MQTT_MSG_TYPE_PUBREL, msg_id)) {
                 ESP_LOGD(TAG, "Receive MQTT_MSG_TYPE_PUBCOMP, finish QoS2 publish");
+            client->event.event_id = MQTT_EVENT_PUBLISHED;
+            esp_mqtt_dispatch_event(client);
             }
             break;
         case MQTT_MSG_TYPE_PINGREQ:
@@ -689,7 +692,10 @@ static void esp_mqtt_task(void *pv)
                 }
 
                 if (platform_tick_get_ms() - client->keepalive_tick > client->connect_info.keepalive * 1000 / 2) {
-                    esp_mqtt_client_ping(client);
+                    if (esp_mqtt_client_ping(client) == ESP_FAIL) {
+                        esp_mqtt_abort_connection(client);
+                        break;
+                    }
                     client->keepalive_tick = platform_tick_get_ms();
                 }
 
@@ -737,25 +743,20 @@ esp_err_t esp_mqtt_client_stop(esp_mqtt_client_handle_t client)
 {
     client->run = false;
     xEventGroupWaitBits(client->status_bits, STOPPED_BIT, false, true, portMAX_DELAY);
-    client->state = MQTT_STATE_UNKNOW;
+    client->state = MQTT_STATE_UNKNOWN;
     return ESP_OK;
 }
 
-static int esp_mqtt_client_ping(esp_mqtt_client_handle_t client)
+static esp_err_t esp_mqtt_client_ping(esp_mqtt_client_handle_t client)
 {
-    if (client->state != MQTT_STATE_CONNECTED) {
-        ESP_LOGE(TAG, "Client has not connected");
-        return -1;
-    }
-
     client->mqtt_state.outbound_message = mqtt_msg_pingreq(&client->mqtt_state.mqtt_connection);
 
     if (mqtt_write_data(client) != ESP_OK) {
         ESP_LOGE(TAG, "Error sending ping");
-        return -1;
+        return ESP_FAIL;
     }
     ESP_LOGD(TAG, "Sent PING successful");
-    return 0;
+    return ESP_OK;
 }
 
 int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char *topic, int qos)
