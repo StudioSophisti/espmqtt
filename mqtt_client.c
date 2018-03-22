@@ -725,14 +725,13 @@ esp_err_t esp_mqtt_client_start(esp_mqtt_client_handle_t client)
         ESP_LOGE(TAG, "Client has started");
         return ESP_FAIL;
     }
-    if (xTaskCreate(esp_mqtt_task, "mqtt_task", client->config->task_stack, client, client->config->task_prio, NULL) != pdTRUE) {
+    if (xTaskCreatePinnedToCore(esp_mqtt_task, "mqtt_task", client->config->task_stack, client, client->config->task_prio, NULL, 0) != pdTRUE) {
         ESP_LOGE(TAG, "Error create mqtt task");
         return ESP_FAIL;
     }
     xEventGroupClearBits(client->status_bits, STOPPED_BIT);
     return ESP_OK;
 }
-
 
 esp_err_t esp_mqtt_client_stop(esp_mqtt_client_handle_t client)
 {
