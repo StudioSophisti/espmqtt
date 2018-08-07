@@ -58,14 +58,14 @@ typedef esp_err_t (* mqtt_event_callback_t)(esp_mqtt_event_handle_t event);
 
 typedef struct {
     mqtt_event_callback_t event_handle;
-    const char *host;
-    const char *uri;
+    char host[MQTT_MAX_HOST_LEN];
+    char uri[MQTT_MAX_HOST_LEN];
     uint32_t port;
-    const char *client_id;
-    const char *username;
-    const char *password;
-    const char *lwt_topic;
-    const char *lwt_msg;
+    char client_id[MQTT_MAX_CLIENT_LEN];
+    char username[MQTT_MAX_USERNAME_LEN];
+    char password[MQTT_MAX_PASSWORD_LEN];
+    char lwt_topic[MQTT_MAX_LWT_TOPIC];
+    char lwt_msg[MQTT_MAX_LWT_MSG];
     int lwt_qos;
     int lwt_retain;
     int lwt_msg_len;
