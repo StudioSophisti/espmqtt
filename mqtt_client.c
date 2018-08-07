@@ -67,6 +67,7 @@ struct esp_mqtt_client {
     int auto_reconnect;
     esp_mqtt_event_t event;
     bool run;
+    bool wait_for_ping_resp;
     outbox_handle_t outbox;
     EventGroupHandle_t status_bits;
 };
@@ -190,6 +191,7 @@ static esp_err_t esp_mqtt_destroy_config(esp_mqtt_client_handle_t client)
 static esp_err_t esp_mqtt_connect(esp_mqtt_client_handle_t client, int timeout_ms)
 {
     int write_len, read_len, connect_rsp_code;
+    client->wait_for_ping_resp = false;
     mqtt_msg_init(&client->mqtt_state.mqtt_connection,
                   client->mqtt_state.out_buffer,
                   client->mqtt_state.out_buffer_length);
@@ -255,6 +257,7 @@ static esp_err_t esp_mqtt_abort_connection(esp_mqtt_client_handle_t client)
     client->state = MQTT_STATE_WAIT_TIMEOUT;
     ESP_LOGI(TAG, "Reconnect after %d ms", client->wait_timeout_ms);
     client->event.event_id = MQTT_EVENT_DISCONNECTED;
+    client->wait_for_ping_resp = false;
     esp_mqtt_dispatch_event(client);
     return ESP_OK;
 }
@@ -326,7 +329,7 @@ esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *co
 
     client->keepalive_tick = platform_tick_get_ms();
     client->reconnect_tick = platform_tick_get_ms();
-
+    client->wait_for_ping_resp = false;
     int buffer_size = config->buffer_size;
     if (buffer_size <= 0) {
         buffer_size = MQTT_BUFFER_SIZE_BYTE;
@@ -628,7 +631,7 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
             break;
         case MQTT_MSG_TYPE_PUBCOMP:
             ESP_LOGD(TAG, "received MQTT_MSG_TYPE_PUBCOMP");
-            if (is_valid_mqtt_msg(client, MQTT_MSG_TYPE_PUBREL, msg_id)) {
+            if (is_valid_mqtt_msg(client, MQTT_MSG_TYPE_PUBLISH, msg_id)) {
                 ESP_LOGD(TAG, "Receive MQTT_MSG_TYPE_PUBCOMP, finish QoS2 publish");
                 client->event.event_id = MQTT_EVENT_PUBLISHED;
                 esp_mqtt_dispatch_event(client);
@@ -636,7 +639,7 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
             break;
         case MQTT_MSG_TYPE_PINGRESP:
             ESP_LOGD(TAG, "MQTT_MSG_TYPE_PINGRESP");
-            // Ignore
+            client->wait_for_ping_resp = false;
             break;
     }
 
@@ -698,10 +701,21 @@ static void esp_mqtt_task(void *pv)
                 }
 
                 if (platform_tick_get_ms() - client->keepalive_tick > client->connect_info.keepalive * 1000 / 2) {
-                    if (esp_mqtt_client_ping(client) == ESP_FAIL) {
+                    //No ping resp from last ping => Disconnected
+                	if(client->wait_for_ping_resp){
+                    	ESP_LOGE(TAG, "No PING_RESP, disconnected");
+                    	esp_mqtt_abort_connection(client);
+                    	client->wait_for_ping_resp = false;
+                    	break;
+                    }
+                	if (esp_mqtt_client_ping(client) == ESP_FAIL) {
+                        ESP_LOGE(TAG, "Can't send ping, disconnected");
                         esp_mqtt_abort_connection(client);
                         break;
+                    } else {
+                    	client->wait_for_ping_resp = true;
                     }
+                	ESP_LOGD(TAG, "PING sent");
                 }
 
                 //Delete mesaage after 30 senconds
@@ -736,10 +750,19 @@ esp_err_t esp_mqtt_client_start(esp_mqtt_client_handle_t client)
         ESP_LOGE(TAG, "Client has started");
         return ESP_FAIL;
     }
-    if (xTaskCreatePinnedToCore(esp_mqtt_task, "mqtt_task", client->config->task_stack, client, client->config->task_prio, NULL, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "Error create mqtt task");
-        return ESP_FAIL;
-    }
+#if MQTT_CORE_SELECTION_ENABLED
+    	ESP_LOGD(TAG, "Core selection enabled on %u", MQTT_TASK_CORE);
+		if (xTaskCreatePinnedToCore(esp_mqtt_task, "mqtt_task", client->config->task_stack, client, client->config->task_prio, NULL, MQTT_TASK_CORE) != pdTRUE) {
+			ESP_LOGE(TAG, "Error create mqtt task");
+			return ESP_FAIL;
+		}
+#else
+    	ESP_LOGD(TAG, "Core selection disabled");
+		if (xTaskCreate(esp_mqtt_task, "mqtt_task", client->config->task_stack, client, client->config->task_prio, NULL) != pdTRUE) {
+			ESP_LOGE(TAG, "Error create mqtt task")	;
+			return ESP_FAIL;
+		}
+#endif
     return ESP_OK;
 }
 
@@ -820,9 +843,6 @@ int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *topic, 
     if (len <= 0) {
         len = strlen(data);
     }
-    if (qos > 0) {
-        mqtt_enqueue(client);
-    }
 
     client->mqtt_state.outbound_message = mqtt_msg_publish(&client->mqtt_state.mqtt_connection,
                                           topic, data, len,
@@ -832,6 +852,7 @@ int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *topic, 
         client->mqtt_state.pending_msg_type = mqtt_get_type(client->mqtt_state.outbound_message->data);
         client->mqtt_state.pending_msg_id = pending_msg_id;
         client->mqtt_state.pending_msg_count ++;
+        mqtt_enqueue(client);
     }
 
     if (mqtt_write_data(client) != ESP_OK) {
